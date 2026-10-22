@@ -1,0 +1,52 @@
+#include "Bullet.h"
+
+namespace
+{
+	constexpr float kBulletRadius = 10.0f; // 弾の半径
+	constexpr int kBulletDivNum = 8; // 弾の存在数
+}
+
+Bullet::Bullet(VECTOR startPos, VECTOR startVel, int color) :
+	m_pos(startPos),
+	m_velocity(startVel),
+	m_isAlive(true),
+	m_color(color)
+{
+
+}
+
+Bullet::~Bullet()
+{
+
+}
+
+void Bullet::Init()
+{
+
+}
+void Bullet::Update()
+{
+	// 位置を動かす
+	m_pos = VAdd(m_pos, m_velocity);
+	// 弾に重力を掛ける
+	m_velocity.y -= 1.5f;
+	// 床(今は0.0fが床)に当たった場合、弾は消える（m_isAliveの消滅）
+	if (m_pos.y <= 0.0f)
+	{
+		m_pos.y = 0.0f;
+		m_isAlive = false;
+	}
+}
+void Bullet::Draw()
+{
+	// 弾が存在している間のみ描画する
+	if (!m_isAlive)return;
+
+	// 弾を表示
+	DrawSphere3D(VGet(m_pos.x, m_pos.y, m_pos.z), kBulletRadius, kBulletDivNum, m_color, m_color, true);
+}
+
+VECTOR Bullet::GetPos()
+{
+	return m_pos;
+}

@@ -1,0 +1,566 @@
+#include "Player.h"
+#include <DxLib.h>
+#include <cmath>
+#include <cassert>
+#include "../Systems/Pad.h"
+#include "../Systems/Game.h"
+#include "../Weapons/Weapon.h"
+#include "../Weapons/Bomb.h"
+
+namespace
+{
+	// アニメーションの種類
+	constexpr const char* kIdleAnim = "root|Idle";      // 待機アニメーション
+	constexpr const char* kShotAnim = "root|Shot";      // 射撃アニメーション
+	constexpr const char* kRunAnim  = "root|Run";	    // 走るアニメーション
+
+	constexpr float kAnimSpeed = 1.0f;                  // アニメーションスピード
+	constexpr float kSpeed = 18.0f;                     // プレイヤーの移動速度
+	constexpr float kAttackingSpeed = 13.0f;            // プレイヤーの攻撃中の移動速度
+	constexpr float kEnemyInkSpeed = 6.0f;              // エネミーインクに当たっているときの移動速度
+	constexpr float kDiveSpeed = 30.0f;                 // プレイヤーの潜り中の移動速度
+	constexpr float kDiveEnemyInkSpeed = 5.0f;          // 敵インクの潜り中の移動速度
+	constexpr float kDiveFloorSpeed = 12.0f;            // 何も塗られていない所の潜り中の移動速度
+	constexpr float kShotSpeed = 30.0f;                 // 弾速度
+	constexpr float kGravity = 0.8f;                    // 重力
+	constexpr float kJumpPower = 20.0f;                 // ジャンプ力
+	constexpr float kWeaponPosY = 170.0f;               // ウェポンのy軸の位置
+	constexpr VECTOR kScale = { 2.0f,2.0f,2.0f };       // プレイヤーの大きさ
+
+	constexpr float kAnalogInputScale = 1000.0f;        // スティック入力を正規化するために割る
+	constexpr float kDeadZone = 0.2f;                   // スティックのデッドゾーン
+	constexpr float kGlobalAnimframe = 0.7f;            // アニメーション全体の再生速度
+	constexpr int kTrigger = 128;                       // アナログトリガーの判定
+	constexpr int kRespawnFrame = 180;                  // リスポーンまでの時間
+
+	// 当たり判定に関連したマジックナンバー
+	constexpr float kDiveColOffsetY = 25.0f;            // 潜り状態のYオフセット
+	constexpr float kDiveColRadius = 60.0f;             // 潜り判定の球の半径
+	constexpr float kDiveHitRadius = 80.0f;             // 潜り状態の球の当たり判定半径
+	constexpr float kCapsuleBottomOffsetY = 40.0f;      // カプセルの下端のオフセット
+	constexpr float kCapsuleTopOffsetY = 230.0f;        // カプセルの上端のオフセット
+	constexpr float kCapsuleRadius = 40.0f;             // 立体カプセルの半径
+	constexpr float kBodyHitBoxOffsetY = 150.0f;        // プレイヤーの球のオフセット
+	constexpr float kBodyHitBoxRadius = 90.0f;          // プレイヤーの球の半径
+	constexpr int kMeshDivision = 16;                   // 球を描画する際の分割数
+	constexpr int kCapsuleDivision = 8;                 // カプセルを描画する際の分割数
+}
+
+Player::Player(StageManager* stageManager, int padNo, int playerColor) :
+	m_pStageManager(stageManager),
+	m_modelHandle(-1),
+	m_weaponHandle(-1),
+	m_handFrameIndex(-1),
+	m_angle(0.0f),
+	m_move{ 0.0f,0.0f,0.0f },
+	m_pos{ 0.0f, 0.0f, 0.0f },
+	m_respawnPos{ 0.0f, 0.0f, 0.0f },
+	m_isShooting(false),
+	m_velocityY(0.0f),
+	m_idleAnim(-1),
+	m_runAnim(-1),
+	m_shotAnim(-1),
+	m_respawnTimer(0),
+	m_padNo(padNo),
+	m_playerColor(playerColor),
+	m_shotSE(),
+    m_walkSE(),
+    m_inkWalkSE(),
+    m_deathSE(),
+    m_hitSE(),
+    m_diveSE(),
+    m_diveMoveSE()
+{
+	m_pWeapon = std::make_unique<Weapon>(stageManager, playerColor);
+	m_pBomb = std::make_unique<Bomb>();
+}
+
+Player::~Player()
+{
+	MV1DeleteModel(m_modelHandle);
+	MV1DeleteModel(m_weaponHandle);
+	StopSoundMem(m_shotSE);
+	DeleteSoundMem(m_shotSE);
+	StopSoundMem(m_walkSE);
+	DeleteSoundMem(m_walkSE);
+	StopSoundMem(m_deathSE);
+	DeleteSoundMem(m_deathSE);
+	StopSoundMem(m_hitSE);
+	DeleteSoundMem(m_hitSE);
+
+	// ロードしたダメージUIをメモリから削除
+	for (int handle : m_damageUIHandle)
+	{
+		if (handle != -1)
+		{
+			DeleteGraph(handle);
+		}
+	}
+}
+
+void Player::Init()
+{
+	if (m_playerColor == 1)// プレイヤーオレンジ
+	{
+		m_modelHandle = MV1LoadModel("data/Models/PlayerOrange.mv1");
+	}
+	else// プレイヤーブルー
+	{
+		m_modelHandle = MV1LoadModel("data/Models/PlayerBlue.mv1");
+	}
+	assert(m_modelHandle != -1);
+	// ブキのモデル
+	m_weaponHandle = MV1LoadModel("data/Models/Weapon.mv1");
+	assert(m_weaponHandle != -1);
+
+	m_handFrameIndex = MV1SearchFrame(m_modelHandle, "RightHandIndex1");
+	m_animation.Init(m_modelHandle);
+
+	m_idleAnim = MV1GetAnimIndex(m_modelHandle, kIdleAnim);
+	m_shotAnim = MV1GetAnimIndex(m_modelHandle, kShotAnim);
+	m_runAnim = MV1GetAnimIndex(m_modelHandle, kRunAnim);
+
+	m_shotSE = LoadSoundMem("data/SE/InkShot.mp3");      // 攻撃中のSE
+	m_walkSE = LoadSoundMem("data/SE/Walk.mp3");         // 歩きSE
+	m_inkWalkSE = LoadSoundMem("data/SE/InkWalk.mp3");   // インクの上のSE
+	m_deathSE = LoadSoundMem("data/SE/Dead.mp3");        // 死のSE
+	m_hitSE = LoadSoundMem("data/SE/Hit.mp3");           // ヒット時のSE
+	m_diveSE = LoadSoundMem("data/SE/Dive.mp3");         // 潜りのSE
+	m_diveMoveSE = LoadSoundMem("data/SE/DiveMove.mp3"); // 潜り移動のSE
+
+	// プレイヤーの色によって相手のインク画像をロードする
+	if (m_playerColor == 1)// プレイヤーオレンジ
+	{
+		m_damageUIHandle[0] = LoadGraph("data/UI/blueDamageUI_1.png");
+		m_damageUIHandle[1] = LoadGraph("data/UI/blueDamageUI_2.png");
+		m_damageUIHandle[2] = LoadGraph("data/UI/blueDamageUI_3.png");
+	}
+	else// プレイヤーブルー
+	{
+		m_damageUIHandle[0] = LoadGraph("data/UI/orangeDamageUI_1.png");
+		m_damageUIHandle[1] = LoadGraph("data/UI/orangeDamageUI_2.png");
+		m_damageUIHandle[2] = LoadGraph("data/UI/orangeDamageUI_3.png");
+	}
+
+	// 正しく画像が読み込めたか
+	for (int handle : m_damageUIHandle)
+	{
+		assert(handle != -1 && "Damage UI が ない！");
+	}
+
+	// 初期のプレイヤーの大きさ
+	MV1SetScale(m_modelHandle, kScale);
+
+	m_animation.Play(m_idleAnim, true, kAnimSpeed);
+	m_state = PlayerState::Idle;
+}
+void Player::Update(float cameraAngle, float cameraPitch, float timeScale)
+{
+	// 死亡処理
+	if (m_state == PlayerState::Death)
+	{
+		m_respawnTimer--;
+
+		if (m_respawnTimer <= 0)
+		{
+			Respawn();
+		}
+		return;
+	}
+
+	int x, y;
+	// プレイヤー
+	GetJoypadAnalogInput(&x, &y, m_padNo);
+
+	float stickX = x / kAnalogInputScale;
+	float stickY = y / kAnalogInputScale;
+
+	// デッドゾーン（微妙な入力を無視する）
+	float deadZone = kDeadZone;
+	if (fabs(stickX) < deadZone)stickX = 0.0f;
+	if (fabs(stickY) < deadZone)stickY = 0.0f;
+
+	m_move = { 0.0f,0.0f,0.0f };
+
+	// 移動ベクトルの計算
+	// カメラの水平方向を基準にしてスティックを3D座標に変換する
+	// 前後
+	m_move.x += cosf(cameraAngle) * stickY;
+	m_move.z += sinf(cameraAngle) * stickY;
+	// 左右
+	m_move.x += -sinf(cameraAngle) * stickX;
+	m_move.z += cosf(cameraAngle) * stickX;
+
+	float len = sqrtf(m_move.x * m_move.x + m_move.z * m_move.z);
+	if (len > 0)
+	{
+		// 移動ベクトルから角度を作る
+		m_angle = atan2f(-m_move.x, -m_move.z);
+
+		// 移動ベクトルを正規化する
+		m_move.x /= len;
+		m_move.z /= len;
+	}
+
+	// 入力
+	XINPUT_STATE xinputState;
+	GetJoypadXInputState(m_padNo, &xinputState);
+	bool isWeaponPress = (xinputState.RightTrigger > kTrigger);// RTが押された
+	bool isDivePress = (xinputState.LeftTrigger > kTrigger);   // LTが押された
+	bool isBombPress = Pad::IsPress(m_padNo, PAD_INPUT_6);     // RBが押された
+
+	int currentColor = m_pStageManager->GetPaintColor(m_pos.x, m_pos.z);
+	bool isMyInk = (currentColor == m_playerColor);// 自分のインクの上にいるか
+	bool isEnemyInk = (currentColor != 0 && currentColor != m_playerColor);// 敵のインクの上にいるか
+
+	float speed = kSpeed;
+
+	if (isDivePress)
+	{
+		
+		m_isDiving = true;
+
+		if (m_state != PlayerState::Dive)
+		{
+			// SEの再生
+			StopSoundMem(m_shotSE);
+			StopSoundMem(m_walkSE);
+			// 潜ったSEの再生
+			StopSoundMem(m_diveSE);
+			ChangeVolumeSoundMem(200, m_diveSE);
+			PlaySoundMem(m_diveSE, DX_PLAYTYPE_BACK);
+
+			m_state = PlayerState::Dive;
+		}
+
+		if (!m_isGround)
+		{
+			speed = kDiveSpeed;
+		}
+
+		else if (isMyInk)
+		{
+			speed = kDiveSpeed;
+			// hpを回復する
+			m_hp += 0.5f;
+			if (m_hp > m_maxHp)
+			{
+				m_hp = m_maxHp;
+			}
+		}
+		else if (isEnemyInk)
+		{
+			speed = kDiveEnemyInkSpeed;
+		}
+		else
+		{
+			speed = kDiveFloorSpeed;
+		}
+
+#ifdef _DEBUG
+		printfDx("潜ってる～\n");
+#endif // DEBUG
+	}
+	else
+	{
+		m_isDiving = false;
+		if (isEnemyInk)
+		{
+			speed = kEnemyInkSpeed;
+		}
+	}
+
+	// 攻撃中はプレイヤーのスピードが遅くなる
+	if (isWeaponPress)
+	{
+		if (m_state != PlayerState::Shot)
+		{
+			m_animation.Play(m_shotAnim, true, kAnimSpeed);
+			// SEの再生
+			StopSoundMem(m_walkSE);
+
+			StopSoundMem(m_shotSE);
+			ChangeVolumeSoundMem(200, m_shotSE);
+			PlaySoundMem(m_shotSE, DX_PLAYTYPE_LOOP);
+			m_state = PlayerState::Shot;
+		}
+		m_isShooting = true;
+
+		// 攻撃中は移動速度を遅くする
+		speed = kAttackingSpeed;
+		if (isEnemyInk)
+		{
+			speed = kEnemyInkSpeed;
+		}
+	}
+
+	else
+	{
+		if (m_state == PlayerState::Shot)
+		{
+			StopSoundMem(m_shotSE);
+		}
+
+		// 歩いている
+		if (len > 0)
+		{
+			if (m_state != PlayerState::Move)
+			{
+				m_animation.Play(m_runAnim, true, kAnimSpeed);
+				// SEの再生
+				StopSoundMem(m_walkSE);
+				ChangeVolumeSoundMem(200, m_walkSE);
+				PlaySoundMem(m_walkSE, DX_PLAYTYPE_LOOP);
+				m_state = PlayerState::Move;
+			}
+		}
+		else
+		{
+		    if (m_state == PlayerState::Move)
+		    {
+			    StopSoundMem(m_walkSE);
+		    }
+			if (m_state != PlayerState::Idle)
+			{
+				m_animation.Play(m_idleAnim, true, kAnimSpeed);
+				m_state = PlayerState::Idle;
+			}
+		}
+	}
+
+	m_move.x = m_move.x * speed * timeScale;
+	m_move.z = m_move.z * speed * timeScale;
+
+	m_pos.x += m_move.x;
+	m_pos.z += m_move.z;
+
+	// 入力情報は優先度をつけて管理する
+	if (!m_isDiving && isWeaponPress)
+	{
+		VECTOR weaponPos = VGet(m_pos.x, m_pos.y + kWeaponPosY, m_pos.z);
+
+		float shotSpeed = kShotSpeed;
+
+		// 撃っている向き
+		VECTOR shotVelocity;
+		shotVelocity.x = -cosf(cameraPitch) * cosf(cameraAngle) * shotSpeed;
+		shotVelocity.z = -cosf(cameraPitch) * sinf(cameraAngle) * shotSpeed;
+		shotVelocity.y = -sinf(cameraPitch) * shotSpeed;
+
+		m_pWeapon->UseWeapon(weaponPos, shotVelocity);
+
+		m_isShooting = true;
+	}
+	else
+	{
+		m_isShooting = false;
+	}
+	if (isBombPress)
+	{
+		m_pBomb->Throw();
+	}
+
+	if (m_isShooting)
+	{
+		// カメラの方向を見ながらインクを撃つ
+		// atan2fでcos,sinのカメラアングルを合わせる
+		m_angle = atan2f(cosf(cameraAngle), sinf(cameraAngle));
+	}
+
+	m_pWeapon->Update();
+	Jump();
+	// アニメーションの再生速度
+	m_animation.SetGlobalSpeed(kGlobalAnimframe* timeScale);
+	m_animation.Update();
+}
+void Player::Draw()
+{
+	if (m_state == PlayerState::Death)
+	{
+		return;
+	}
+
+	m_pWeapon->Draw();
+
+	// 潜り状態のプレイヤーの当たり判定(球)
+	if (m_isDiving)
+	{
+		if (m_playerColor == 1)// プレイヤーオレンジ
+		{
+			DrawSphere3D(VGet(m_pos.x, m_pos.y + kDiveColOffsetY, m_pos.z),
+				kDiveColRadius, kMeshDivision,
+				::GetColor(255, 125, 0),
+				::GetColor(255, 125, 0),
+				true);
+		}
+		else// プレイヤーブルー
+		{
+			DrawSphere3D(VGet(m_pos.x, m_pos.y + kDiveColOffsetY, m_pos.z),
+				kDiveColRadius, kMeshDivision,
+				::GetColor(0, 0, 255),
+				::GetColor(0, 0, 255),
+				true);
+		}
+		
+#ifdef _DEBUG
+		DrawSphere3D(VGet(m_pos.x, m_pos.y + kDiveColOffsetY, m_pos.z),
+			kDiveHitRadius, kMeshDivision,
+			::GetColor(0, 255, 0),
+			::GetColor(0, 255, 0),
+			false);
+#endif // DEBUG
+
+		return;
+	}
+
+	// プレイヤーの当たり判定の描画(現在は球)
+#ifdef _DEBUG
+	int playerCapsule = DrawCapsule3D(VGet(m_pos.x + 0.0f, m_pos.y + kCapsuleBottomOffsetY, m_pos.z + 0.0f),
+		VGet(m_pos.x + 0.0f, m_pos.y + kCapsuleTopOffsetY, m_pos.z + 0.0f),
+		kCapsuleRadius, kCapsuleDivision, ::GetColor(0, 255, 0), ::GetColor(255, 255, 255), false);
+	DrawSphere3D(VGet(m_pos.x, m_pos.y + kBodyHitBoxOffsetY, m_pos.z),
+		kBodyHitBoxRadius, kMeshDivision,
+		::GetColor(0, 255, 0),
+		::GetColor(0, 255, 0),
+		false);
+#endif
+
+	/*プレイヤーモデルの回転*/
+	// 向き
+	MATRIX rot = MGetRotY(m_angle);
+	// 大きさ
+	MATRIX scale = MGetScale(kScale);
+	// 動き
+	MATRIX trans = MGetTranslate(VGet(m_pos.x, m_pos.y, m_pos.z));
+	// 行列の合成
+	MATRIX worldMatrix = MMult(MMult(scale, rot),trans);
+	MV1SetMatrix(m_modelHandle, worldMatrix);
+
+	// プレイヤー表示
+	MV1DrawModel(m_modelHandle);
+
+	if (!m_isDiving && m_handFrameIndex != -1)
+	{
+		// 手首のローカルワールドを取得
+		MATRIX handMatrix = MV1GetFrameLocalWorldMatrix(m_modelHandle, m_handFrameIndex);
+
+		// 武器の大きさ
+		MATRIX weaponScale = MGetScale(VGet(80.0f, 80.0f, 80.0f));
+
+		// 武器の向きの修正
+		MATRIX weaponRot = MMult(MGetRotY(DX_PI_F/2.0f),MGetRotX(DX_PI_F/2.0f));
+
+		// 武器のローカル座標を取得
+		MATRIX weaponMatrix = MMult(weaponScale,MMult(weaponRot,handMatrix));
+
+		MV1SetMatrix(m_weaponHandle, weaponMatrix);
+		MV1DrawModel(m_weaponHandle);
+	}
+
+	m_pWeapon->Draw();
+
+}
+
+void Player::DrawDamageUI(int offsetX)
+{
+	int selectIndex = -1;
+
+	if (m_hp <= 10)
+	{
+		selectIndex = 2;
+	}
+	else if (m_hp <= 60)
+	{
+		selectIndex = 1;
+	}
+	else if (m_hp <= 90)
+	{
+		selectIndex = 0;
+	}
+
+	if (selectIndex != -1 && m_damageUIHandle[selectIndex] != -1)
+	{
+		DrawExtendGraph(offsetX, 0, 
+			offsetX+Game::kScreenCenterX, Game::kScreenHeight, 
+			m_damageUIHandle[selectIndex], TRUE);
+	}
+}
+
+void Player::Jump()
+{
+	// A(ジャンプボタン)が押された
+	if (m_isGround && Pad::IsTrigger(m_padNo, PAD_INPUT_1))
+	{
+		m_velocityY = kJumpPower;
+		m_isGround = false;
+	}
+	// 重力
+	m_velocityY -= kGravity;
+
+	// 位置更新
+	m_pos.y += m_velocityY;
+	if (m_pos.y <= 0.0f)
+	{
+		m_pos.y = 0.0f;
+		m_velocityY = 0.0f;
+		m_isGround = true;
+	}
+}
+
+VECTOR Player::GetPos() const
+{
+	return m_pos;
+}
+
+void Player::SetPos(VECTOR pos)
+{
+	m_pos = pos;
+}
+
+void Player::SetRespawnPos(const VECTOR& pos)
+{
+	m_respawnPos = pos;
+	m_pos = pos;
+}
+
+bool Player::IsShooting() const
+{
+	return m_isShooting;
+}
+
+void Player::ApplyDamage(float damage)
+{
+	// 受け取ったダメージ分だけHPを減らす
+	m_hp -= static_cast<int>(damage);
+	// SEの再生
+	StopSoundMem(m_hitSE);
+	ChangeVolumeSoundMem(200, m_hitSE);
+	PlaySoundMem(m_hitSE, DX_PLAYTYPE_BACK);
+
+	if (m_hp < 0)m_hp = 0;
+
+#ifdef _DEBUG
+	printfDx("プレイヤー[%d] 現在のHP : %d / %d:HP\n", m_padNo, m_hp, m_maxHp);
+#endif // _DEBUG
+
+	// HPが0になった場合、プレイヤーは初期位置に戻る
+	if (m_hp <= 0&&m_state!=PlayerState::Death)
+	{
+		m_state = PlayerState::Death;
+		m_respawnTimer = kRespawnFrame; // リスポーン時間
+	}
+}
+
+void Player::Respawn()
+{
+	m_pos = m_respawnPos;
+
+	m_hp = m_maxHp;
+	
+	m_state = PlayerState::Idle;
+}
+
+std::vector<std::unique_ptr<Bullet>>& Player::GetBullets()
+{
+	return m_pWeapon->GetBullets();
+}
