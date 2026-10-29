@@ -12,6 +12,10 @@
 
 対応機種：Windows
 
+対応コントローラー：XBoxコントローラー
+
+対象人数：2人
+
 制作人数：個人制作（1人）
 
 動画URL　https://www.youtube.com/watch?v=cFWbmGSR_O4
